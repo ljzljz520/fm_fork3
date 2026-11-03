@@ -17,16 +17,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case statusMessageTimeoutMsg:
-		m.statusMessage = ""
+		// Only the timeout of the request that still owns the status
+		// message may clear it. A timeout from a superseded preview is
+		// ignored.
+		if msg.request == m.statusRequest {
+			m.statusMessage = ""
+			m.statusRequest = 0
+		}
 
 		return m, nil
 	case tea.WindowSizeMsg:
 		halfSize := msg.Width / 2
 		height := msg.Height - statusbar.Height
 
-		cmds = append(cmds, m.image.SetSizeCmd(halfSize, height))
-		cmds = append(cmds, m.markdown.SetSizeCmd(halfSize, height))
-		cmds = append(cmds, m.csv.SetSizeCmd(halfSize, height))
+		// Advance the size generation so resize driven re-renders are
+		// tagged with it: results rendered for older sizes are dropped
+		// even if they finish after the new size render.
+		m.previewSize++
+
+		cmds = append(cmds, m.image.SetSizeCmd(halfSize, height, m.previewSize))
+		cmds = append(cmds, m.markdown.SetSizeCmd(halfSize, height, m.previewSize))
+		cmds = append(cmds, m.csv.SetSizeCmd(halfSize, height, m.previewSize))
 
 		m.filetree.SetSize(halfSize, height-3)
 		m.secondaryFiletree.SetSize(halfSize, height-3)
@@ -55,6 +66,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			m.state = idleState
 			m.showTextInput = false
+			// Cancel in flight preview work and invalidate all
+			// bubbles so content, error and timeout messages that
+			// complete after the reset are rejected.
+			m.resetPreview()
 			m.disableAllViewports()
 			m.resetViewports()
 			m.filetree.SetDisabled(false)

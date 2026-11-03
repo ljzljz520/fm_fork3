@@ -3,10 +3,10 @@
 package csv
 
 import (
+	"context"
 	"encoding/csv"
-	"fmt"
-	"log"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/charmbracelet/bubbles/viewport"
@@ -14,12 +14,23 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/lipgloss/table"
 
+	"github.com/mistakenelf/fm/internal/preview"
 	"github.com/mistakenelf/fm/polish"
 )
 
-type statusMessageTimeoutMsg struct{}
-type errorMsg string
+type statusMessageTimeoutMsg struct {
+	request preview.RequestID
+}
+
+type errorMsg struct {
+	request preview.RequestID
+	size    preview.SizeVersion
+	err     string
+}
+
 type csvMsg struct {
+	request preview.RequestID
+	size    preview.SizeVersion
 	headers []string
 	records [][]string
 }
@@ -44,55 +55,149 @@ type Model struct {
 	Table                 *table.Table
 	StatusMessage         string
 	StatusMessageLifetime time.Duration
-	statusMessageTimer    *time.Timer
 	ViewportDisabled      bool
 	Headers               []string
 	Records               [][]string
+
+	request       preview.RequestID
+	size          preview.SizeVersion
+	statusRequest preview.RequestID
+	workCancel    context.CancelFunc
+	statusCancel  context.CancelFunc
 }
 
-// NewStatusMessage sets a new status message, which will show for a limited
-// amount of time.
-func (m *Model) NewStatusMessageCmd(s string) tea.Cmd {
+// parseCSVFile reads and parses a csv file. It is a package level
+// variable so tests can control completion timing and exercise
+// cancellation at an interruptible checkpoint.
+var parseCSVFile = func(filename string) ([]string, [][]string, error) {
+	file, err := os.Open(filepath.Clean(filename))
+	if err != nil {
+		return nil, nil, err
+	}
+
+	defer file.Close()
+
+	reader := csv.NewReader(file)
+
+	headers, err := reader.Read()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	records, err := reader.ReadAll()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return headers, records, nil
+}
+
+func readCSVCmd(
+	ctx context.Context,
+	request preview.RequestID,
+	size preview.SizeVersion,
+	filename string,
+) tea.Cmd {
+	return func() tea.Msg {
+		if preview.Aborted(ctx) {
+			return nil
+		}
+
+		headers, records, err := parseCSVFile(filename)
+		if preview.Aborted(ctx) {
+			return nil
+		}
+
+		if err != nil {
+			return errorMsg{request: request, size: size, err: err.Error()}
+		}
+
+		return csvMsg{
+			request: request,
+			size:    size,
+			headers: headers,
+			records: records,
+		}
+	}
+}
+
+// newStatusMessageCmd sets a new status message, which will show for a
+// limited amount of time.
+func (m *Model) newStatusMessageCmd(request preview.RequestID, s string) tea.Cmd {
 	m.StatusMessage = s
-	if m.statusMessageTimer != nil {
-		m.statusMessageTimer.Stop()
+	m.statusRequest = request
+
+	if m.statusCancel != nil {
+		m.statusCancel()
 	}
 
-	m.statusMessageTimer = time.NewTimer(m.StatusMessageLifetime)
+	ctx, cancel := context.WithCancel(context.Background())
+	m.statusCancel = cancel
+	lifetime := m.StatusMessageLifetime
 
-	// Wait for timeout
 	return func() tea.Msg {
-		<-m.statusMessageTimer.C
-		return statusMessageTimeoutMsg{}
+		timer := time.NewTimer(lifetime)
+
+		select {
+		case <-timer.C:
+			return statusMessageTimeoutMsg{request: request}
+		case <-ctx.Done():
+			timer.Stop()
+			return nil
+		}
 	}
 }
 
-// SetFileName sets current file to highlight.
-func (m *Model) SetFileNameCmd(filename string) tea.Cmd {
-	m.Filename = filename
-
-	return func() tea.Msg {
-		file, err := os.Open(m.Filename)
-		if err != nil {
-			log.Fatal("Error while reading the file", err)
-		}
-
-		defer file.Close()
-
-		reader := csv.NewReader(file)
-
-		headers, err := reader.Read()
-		if err != nil {
-			fmt.Println(err)
-		}
-
-		records, err := reader.ReadAll()
-		if err != nil {
-			fmt.Println("Error reading records")
-		}
-
-		return csvMsg{headers, records}
+func (m *Model) cancelWork() {
+	if m.workCancel != nil {
+		m.workCancel()
+		m.workCancel = nil
 	}
+}
+
+func (m *Model) clearStatus() {
+	m.StatusMessage = ""
+	m.statusRequest = 0
+
+	if m.statusCancel != nil {
+		m.statusCancel()
+		m.statusCancel = nil
+	}
+}
+
+// SetRequest records the latest cross format preview request and
+// cancels work and status timers that belong to an older request.
+func (m *Model) SetRequest(request preview.RequestID) {
+	m.request = request
+	m.cancelWork()
+	m.clearStatus()
+}
+
+// Reset invalidates the bubble after the preview pane was reset.
+func (m *Model) Reset(request preview.RequestID) {
+	m.request = request
+	m.cancelWork()
+	m.Filename = ""
+	m.Headers = nil
+	m.Records = nil
+	m.Viewport.SetContent("")
+	m.Viewport.GotoTop()
+	m.clearStatus()
+}
+
+// SetFileNameCmd sets current file to parse. The command is tagged with
+// request and the current size generation and cancels any previously
+// in flight command.
+func (m *Model) SetFileNameCmd(filename string, request preview.RequestID) tea.Cmd {
+	m.request = request
+	m.Filename = filename
+	m.cancelWork()
+	m.clearStatus()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	m.workCancel = cancel
+
+	return readCSVCmd(ctx, request, m.size, filename)
 }
 
 // New creates a new instance of code.
@@ -113,13 +218,21 @@ func (m Model) Init() tea.Cmd {
 	return nil
 }
 
-// SetSize sets the size of the bubble.
-func (m *Model) SetSizeCmd(w, h int) tea.Cmd {
+// SetSizeCmd sets the size of the bubble. When a file is currently
+// loaded it re-parses for the new size generation; results produced
+// for older sizes are rejected when they arrive.
+func (m *Model) SetSizeCmd(w, h int, size preview.SizeVersion) tea.Cmd {
 	m.Viewport.Width = w
 	m.Viewport.Height = h
+	m.size = size
 
 	if m.Filename != "" {
-		return m.SetFileNameCmd(m.Filename)
+		m.cancelWork()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		m.workCancel = cancel
+
+		return readCSVCmd(ctx, m.request, size, m.Filename)
 	}
 
 	return nil
@@ -149,10 +262,19 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case statusMessageTimeoutMsg:
-		m.StatusMessage = ""
+		if msg.request == m.statusRequest {
+			m.StatusMessage = ""
+			m.statusRequest = 0
+		}
 
 		return m, nil
 	case csvMsg:
+		// Commit only when the result belongs to both the latest
+		// request and the latest size generation.
+		if msg.request != m.request || msg.size != m.size {
+			return m, nil
+		}
+
 		m.Headers = msg.headers
 		m.Records = msg.records
 
@@ -177,12 +299,18 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 
 		return m, nil
 	case errorMsg:
+		if msg.request != m.request || msg.size != m.size {
+			return m, nil
+		}
+
 		m.Filename = ""
-		return m, m.NewStatusMessageCmd(
+
+		return m, m.newStatusMessageCmd(
+			msg.request,
 			lipgloss.NewStyle().
 				Foreground(polish.Colors.Red600).
 				Bold(true).
-				Render(string(msg)),
+				Render(msg.err),
 		)
 	}
 

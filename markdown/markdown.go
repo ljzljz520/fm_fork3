@@ -3,6 +3,7 @@
 package markdown
 
 import (
+	"context"
 	"errors"
 	"time"
 
@@ -12,12 +13,25 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/mistakenelf/fm/filesystem"
+	"github.com/mistakenelf/fm/internal/preview"
 	"github.com/mistakenelf/fm/polish"
 )
 
-type renderMarkdownMsg string
-type errorMsg string
-type statusMessageTimeoutMsg struct{}
+type renderMarkdownMsg struct {
+	request preview.RequestID
+	size    preview.SizeVersion
+	content string
+}
+
+type errorMsg struct {
+	request preview.RequestID
+	size    preview.SizeVersion
+	err     string
+}
+
+type statusMessageTimeoutMsg struct {
+	request preview.RequestID
+}
 
 // Model represents the properties of a markdown bubble.
 type Model struct {
@@ -26,8 +40,22 @@ type Model struct {
 	FileName              string
 	StatusMessage         string
 	StatusMessageLifetime time.Duration
-	statusMessageTimer    *time.Timer
+
+	request       preview.RequestID
+	size          preview.SizeVersion
+	statusRequest preview.RequestID
+	workCancel    context.CancelFunc
+	statusCancel  context.CancelFunc
 }
+
+// The asynchronous command goes through these package level function
+// variables instead of calling the implementations directly, which
+// allows tests to control completion timing and interrupt work at the
+// checkpoints between reading and rendering.
+var (
+	readFileContent = filesystem.ReadFileContent
+	renderContent   = RenderMarkdown
+)
 
 // RenderMarkdown renders the markdown content with glamour.
 func RenderMarkdown(width int, content string) (string, error) {
@@ -50,54 +78,135 @@ func RenderMarkdown(width int, content string) (string, error) {
 	return out, nil
 }
 
-func renderMarkdownCmd(width int, filename string) tea.Cmd {
+func renderMarkdownCmd(
+	ctx context.Context,
+	request preview.RequestID,
+	size preview.SizeVersion,
+	width int,
+	filename string,
+) tea.Cmd {
 	return func() tea.Msg {
-		content, err := filesystem.ReadFileContent(filename)
-		if err != nil {
-			return errorMsg(err.Error())
+		if preview.Aborted(ctx) {
+			return nil
 		}
 
-		markdownContent, err := RenderMarkdown(width, content)
-		if err != nil {
-			return errorMsg(err.Error())
+		content, err := readFileContent(filename)
+		if preview.Aborted(ctx) {
+			return nil
 		}
 
-		return renderMarkdownMsg(markdownContent)
+		if err != nil {
+			return errorMsg{request: request, size: size, err: err.Error()}
+		}
+
+		markdownContent, err := renderContent(width, content)
+		if preview.Aborted(ctx) {
+			return nil
+		}
+
+		if err != nil {
+			return errorMsg{request: request, size: size, err: err.Error()}
+		}
+
+		return renderMarkdownMsg{
+			request: request,
+			size:    size,
+			content: markdownContent,
+		}
 	}
 }
 
-// NewStatusMessage sets a new status message, which will show for a limited
-// amount of time.
-func (m *Model) NewStatusMessageCmd(s string) tea.Cmd {
+// newStatusMessageCmd sets a new status message, which will show for a
+// limited amount of time.
+func (m *Model) newStatusMessageCmd(request preview.RequestID, s string) tea.Cmd {
 	m.StatusMessage = s
+	m.statusRequest = request
 
-	if m.statusMessageTimer != nil {
-		m.statusMessageTimer.Stop()
+	if m.statusCancel != nil {
+		m.statusCancel()
 	}
 
-	m.statusMessageTimer = time.NewTimer(m.StatusMessageLifetime)
+	ctx, cancel := context.WithCancel(context.Background())
+	m.statusCancel = cancel
+	lifetime := m.StatusMessageLifetime
 
 	return func() tea.Msg {
-		<-m.statusMessageTimer.C
-		return statusMessageTimeoutMsg{}
+		timer := time.NewTimer(lifetime)
+
+		select {
+		case <-timer.C:
+			return statusMessageTimeoutMsg{request: request}
+		case <-ctx.Done():
+			timer.Stop()
+			return nil
+		}
 	}
 }
 
-// SetFileName sets current file to render, this
-// returns a cmd which will render the text.
-func (m *Model) SetFileNameCmd(filename string) tea.Cmd {
-	m.FileName = filename
-
-	return renderMarkdownCmd(m.Viewport.Width, filename)
+func (m *Model) cancelWork() {
+	if m.workCancel != nil {
+		m.workCancel()
+		m.workCancel = nil
+	}
 }
 
-// SetSize sets the size of the bubble.
-func (m *Model) SetSizeCmd(w, h int) tea.Cmd {
+func (m *Model) clearStatus() {
+	m.StatusMessage = ""
+	m.statusRequest = 0
+
+	if m.statusCancel != nil {
+		m.statusCancel()
+		m.statusCancel = nil
+	}
+}
+
+// SetRequest records the latest cross format preview request and
+// cancels work and status timers that belong to an older request.
+func (m *Model) SetRequest(request preview.RequestID) {
+	m.request = request
+	m.cancelWork()
+	m.clearStatus()
+}
+
+// Reset invalidates the bubble after the preview pane was reset.
+func (m *Model) Reset(request preview.RequestID) {
+	m.request = request
+	m.cancelWork()
+	m.FileName = ""
+	m.Viewport.SetContent("")
+	m.Viewport.GotoTop()
+	m.clearStatus()
+}
+
+// SetFileNameCmd sets current file to render, this returns a cmd which
+// will render the text, tagged with request and the current size.
+func (m *Model) SetFileNameCmd(filename string, request preview.RequestID) tea.Cmd {
+	m.request = request
+	m.FileName = filename
+	m.cancelWork()
+	m.clearStatus()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	m.workCancel = cancel
+
+	return renderMarkdownCmd(ctx, request, m.size, m.Viewport.Width, filename)
+}
+
+// SetSizeCmd sets the size of the bubble. When a file is currently
+// loaded it re-renders for the new size generation; results rendered
+// for older sizes are rejected when they arrive.
+func (m *Model) SetSizeCmd(w, h int, size preview.SizeVersion) tea.Cmd {
 	m.Viewport.Width = w
 	m.Viewport.Height = h
+	m.size = size
 
 	if m.FileName != "" {
-		return renderMarkdownCmd(m.Viewport.Width, m.FileName)
+		m.cancelWork()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		m.workCancel = cancel
+
+		return renderMarkdownCmd(ctx, m.request, size, w, m.FileName)
 	}
 
 	return nil
@@ -114,7 +223,7 @@ func New() Model {
 	}
 }
 
-// Init initializes the code bubble.
+// Init initializes the markdown bubble.
 func (m Model) Init() tea.Cmd {
 	return nil
 }
@@ -143,22 +252,40 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case renderMarkdownMsg:
+		// Commit only when the result belongs to both the latest
+		// request and the latest size generation.
+		if msg.request != m.request || msg.size != m.size {
+			return m, nil
+		}
+
 		content := lipgloss.NewStyle().
 			Width(m.Viewport.Width).
 			Height(m.Viewport.Height).
-			Render(string(msg))
+			Render(msg.content)
 
 		m.Viewport.SetContent(content)
 
 		return m, nil
 	case errorMsg:
+		if msg.request != m.request || msg.size != m.size {
+			return m, nil
+		}
+
 		m.FileName = ""
-		cmds = append(cmds, m.NewStatusMessageCmd(
+		cmds = append(cmds, m.newStatusMessageCmd(
+			msg.request,
 			lipgloss.NewStyle().
 				Foreground(polish.Colors.Red600).
 				Bold(true).
-				Render(string(msg)),
+				Render(msg.err),
 		))
+	case statusMessageTimeoutMsg:
+		if msg.request == m.statusRequest {
+			m.StatusMessage = ""
+			m.statusRequest = 0
+		}
+
+		return m, nil
 	}
 
 	if !m.ViewportDisabled {

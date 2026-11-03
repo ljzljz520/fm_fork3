@@ -5,6 +5,7 @@ import (
 	"slices"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mistakenelf/fm/internal/preview"
 	"github.com/mistakenelf/fm/polish"
 )
 
@@ -28,6 +29,53 @@ func (m *model) resetViewports() {
 	m.help.GotoTop()
 	m.image.GotoTop()
 	m.csv.GotoTop()
+}
+
+// beginPreviewRequest starts a new cross format preview request. The
+// request id is broadcast to every preview bubble, which cancels work
+// belonging to older requests (including work of the previously active
+// format) and clears stale status messages. The new id is returned so
+// the triggering command can tag its results with it.
+func (m *model) beginPreviewRequest() preview.RequestID {
+	m.previewRequest++
+
+	m.code.SetRequest(m.previewRequest)
+	m.csv.SetRequest(m.previewRequest)
+	m.image.SetRequest(m.previewRequest)
+	m.markdown.SetRequest(m.previewRequest)
+	m.pdf.SetRequest(m.previewRequest)
+
+	m.clearStatusMessage()
+
+	return m.previewRequest
+}
+
+// resetPreview invalidates all preview bubbles after the interface is
+// reset: in flight work and timers are cancelled, rendered content is
+// cleared and any content, error or timeout message that arrives
+// afterwards carries an older request id and is rejected.
+func (m *model) resetPreview() {
+	m.previewRequest++
+
+	m.code.Reset(m.previewRequest)
+	m.csv.Reset(m.previewRequest)
+	m.image.Reset(m.previewRequest)
+	m.markdown.Reset(m.previewRequest)
+	m.pdf.Reset(m.previewRequest)
+
+	m.clearStatusMessage()
+}
+
+// clearStatusMessage cancels the pending status timeout and removes the
+// current status message.
+func (m *model) clearStatusMessage() {
+	m.statusMessage = ""
+	m.statusRequest = 0
+
+	if m.statusCancel != nil {
+		m.statusCancel()
+		m.statusCancel = nil
+	}
 }
 
 func (m *model) updateStatusBar() {

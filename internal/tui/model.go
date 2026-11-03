@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -10,6 +11,7 @@ import (
 	"github.com/mistakenelf/fm/filetree"
 	"github.com/mistakenelf/fm/help"
 	"github.com/mistakenelf/fm/image"
+	"github.com/mistakenelf/fm/internal/preview"
 	"github.com/mistakenelf/fm/internal/theme"
 	"github.com/mistakenelf/fm/keys"
 	"github.com/mistakenelf/fm/markdown"
@@ -59,7 +61,20 @@ type model struct {
 	statusMessage         string
 	directoryBeforeMove   string
 	statusMessageLifetime time.Duration
-	statusMessageTimer    *time.Timer
+
+	// previewRequest is the identity of the latest explicit preview
+	// attempt. It is shared by every preview format and is advanced on
+	// each open and on reset, so results from superseded requests
+	// (including cross format switches) are rejected by every bubble.
+	previewRequest preview.RequestID
+	// previewSize is the current window size generation. Width
+	// sensitive renderers use it to reject results rendered for an
+	// older size after resize driven re-renders.
+	previewSize preview.SizeVersion
+	// statusRequest identifies the request owning statusMessage so a
+	// late timeout cannot clear a newer status message.
+	statusRequest preview.RequestID
+	statusCancel  context.CancelFunc
 }
 
 // New creates a new instance of the UI.

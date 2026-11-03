@@ -4,6 +4,7 @@ package pdf
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"time"
 
@@ -11,12 +12,23 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/ledongthuc/pdf"
+	"github.com/mistakenelf/fm/internal/preview"
 	"github.com/mistakenelf/fm/polish"
 )
 
-type renderPDFMsg string
-type errorMsg string
-type statusMessageTimeoutMsg struct{}
+type renderPDFMsg struct {
+	request preview.RequestID
+	content string
+}
+
+type errorMsg struct {
+	request preview.RequestID
+	err     string
+}
+
+type statusMessageTimeoutMsg struct {
+	request preview.RequestID
+}
 
 // Model represents the properties of a pdf bubble.
 type Model struct {
@@ -25,8 +37,17 @@ type Model struct {
 	FileName              string
 	StatusMessage         string
 	StatusMessageLifetime time.Duration
-	statusMessageTimer    *time.Timer
+
+	request       preview.RequestID
+	statusRequest preview.RequestID
+	workCancel    context.CancelFunc
+	statusCancel  context.CancelFunc
 }
+
+// The asynchronous command goes through this package level function
+// variable instead of calling the implementation directly, which
+// allows tests to drive controllable completion and cancellation.
+var readPDF = ReadPDF
 
 // ReadPDF reads the content of a PDF and returns it as a string.
 func ReadPDF(name string) (string, error) {
@@ -56,40 +77,99 @@ func ReadPDF(name string) (string, error) {
 	return buf.String(), nil
 }
 
-func renderPDFCmd(filename string) tea.Cmd {
+func renderPDFCmd(ctx context.Context, request preview.RequestID, filename string) tea.Cmd {
 	return func() tea.Msg {
-		pdfContent, err := ReadPDF(filename)
-		if err != nil {
-			return errorMsg(err.Error())
+		if preview.Aborted(ctx) {
+			return nil
 		}
 
-		return renderPDFMsg(pdfContent)
+		pdfContent, err := readPDF(filename)
+		if preview.Aborted(ctx) {
+			return nil
+		}
+
+		if err != nil {
+			return errorMsg{request: request, err: err.Error()}
+		}
+
+		return renderPDFMsg{request: request, content: pdfContent}
 	}
 }
 
-// NewStatusMessage sets a new status message, which will show for a limited
-// amount of time.
-func (m *Model) NewStatusMessageCmd(s string) tea.Cmd {
+// newStatusMessageCmd sets a new status message, which will show for a
+// limited amount of time.
+func (m *Model) newStatusMessageCmd(request preview.RequestID, s string) tea.Cmd {
 	m.StatusMessage = s
+	m.statusRequest = request
 
-	if m.statusMessageTimer != nil {
-		m.statusMessageTimer.Stop()
+	if m.statusCancel != nil {
+		m.statusCancel()
 	}
 
-	m.statusMessageTimer = time.NewTimer(m.StatusMessageLifetime)
+	ctx, cancel := context.WithCancel(context.Background())
+	m.statusCancel = cancel
+	lifetime := m.StatusMessageLifetime
 
 	return func() tea.Msg {
-		<-m.statusMessageTimer.C
-		return statusMessageTimeoutMsg{}
+		timer := time.NewTimer(lifetime)
+
+		select {
+		case <-timer.C:
+			return statusMessageTimeoutMsg{request: request}
+		case <-ctx.Done():
+			timer.Stop()
+			return nil
+		}
 	}
 }
 
-// SetFileName sets current file to render, this
-// returns a cmd which will render the pdf.
-func (m *Model) SetFileNameCmd(filename string) tea.Cmd {
-	m.FileName = filename
+func (m *Model) cancelWork() {
+	if m.workCancel != nil {
+		m.workCancel()
+		m.workCancel = nil
+	}
+}
 
-	return renderPDFCmd(filename)
+func (m *Model) clearStatus() {
+	m.StatusMessage = ""
+	m.statusRequest = 0
+
+	if m.statusCancel != nil {
+		m.statusCancel()
+		m.statusCancel = nil
+	}
+}
+
+// SetRequest records the latest cross format preview request and
+// cancels work and status timers that belong to an older request.
+func (m *Model) SetRequest(request preview.RequestID) {
+	m.request = request
+	m.cancelWork()
+	m.clearStatus()
+}
+
+// Reset invalidates the bubble after the preview pane was reset.
+func (m *Model) Reset(request preview.RequestID) {
+	m.request = request
+	m.cancelWork()
+	m.FileName = ""
+	m.Viewport.SetContent("")
+	m.Viewport.GotoTop()
+	m.clearStatus()
+}
+
+// SetFileNameCmd sets current file to render, this returns a cmd which
+// will render the pdf, tagged with request.
+func (m *Model) SetFileNameCmd(filename string, request preview.RequestID) tea.Cmd {
+	m.request = request
+	m.FileName = filename
+	m.cancelWork()
+	m.clearStatus()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	m.workCancel = cancel
+
+	return renderPDFCmd(ctx, request, filename)
 }
 
 // New creates a new instance of a PDF.
@@ -138,22 +218,39 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case renderPDFMsg:
+		if msg.request != m.request {
+			return m, nil
+		}
+
 		pdfContent := lipgloss.NewStyle().
 			Width(m.Viewport.Width).
 			Height(m.Viewport.Height).
-			Render(string(msg))
+			Render(msg.content)
 
 		m.Viewport.SetContent(pdfContent)
 
 		return m, nil
 	case errorMsg:
+		if msg.request != m.request {
+			return m, nil
+		}
+
 		m.FileName = ""
-		return m, m.NewStatusMessageCmd(
+
+		return m, m.newStatusMessageCmd(
+			msg.request,
 			lipgloss.NewStyle().
 				Foreground(polish.Colors.Red600).
 				Bold(true).
-				Render(string(msg)),
+				Render(msg.err),
 		)
+	case statusMessageTimeoutMsg:
+		if msg.request == m.statusRequest {
+			m.StatusMessage = ""
+			m.statusRequest = 0
+		}
+
+		return m, nil
 	}
 
 	if !m.ViewportDisabled {
@@ -164,7 +261,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
-// View returns a string representation of the markdown bubble.
+// View returns a string representation of the pdf bubble.
 func (m Model) View() string {
 	return m.Viewport.View()
 }
